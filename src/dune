@@ -1,0 +1,11 @@
+(library
+  (name roaring_bitmap)
+  (libraries 
+    integers
+    varray
+    vector)
+)
+
+(env
+  (dev
+    (flags (:standard -warn-error -A))))

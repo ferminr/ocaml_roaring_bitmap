@@ -1,0 +1,23 @@
+opam-version: "2.0"
+name: "roaring_bitmap"
+version: "0.1.0"
+maintainer: "Fermin Reig <fermin.reig@gmail.com>"
+authors: ["Fermin Reig <fermin.reig@gmail.com>"]
+homepage: "https://github.com/ferminr/ocaml_roaring_bitmap"
+bug-reports: "https://github.com/ferminr/ocaml_roaring_bitmap/issues"
+dev-repo: "git+https://github.com/ferminr/ocaml_roaring_bitmap.git"
+doc: "https://github.com/ferminr/ocaml_roaring_bitmap"
+license: "MIT"
+synopsis: "TODO"
+description: """
+The algorithm is described in this paper:
+
+TODO
+"""
+depends: [
+  "ocaml" {>= "4.08.0"}
+  "dune"  {>= "2.0.0"}
+]
+build: [
+  ["dune" "build" "-p" name "-j" jobs]
+]
