@@ -2,10 +2,13 @@
   (name roaring_bitmap)
   (libraries 
     integers
-    varray
-    vector)
+    varray)
 )
 
 (env
   (dev
-    (flags (:standard -warn-error -A))))
+    (flags (:standard -warn-error -A)))
+  (release
+    (ocamlopt_flags (:standard -O3)))
+)
+    

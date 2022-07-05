@@ -1,99 +1,160 @@
-(* 
-for down:
-#require "varray";;
-#require "integers";;
 
-*)
-
-
-(* Imperative bitmaps of unsigned32 *)
+module IntHash =
+  struct
+    type t = int
+    let equal (i : int) j = i=j
+    let hash (i : int)= Hashtbl.hash i
+  end
 
 
-type container = Bmap of { mutable sz: int; d: Bytes.t }  | Arr of Unsigned.UInt16.t Varray.t
+
+module IntHashtbl = Hashtbl.Make(IntHash)
+
+type bmapc = { mutable sz: int; d: Bytes.t }
+type container = 
+  | Bmap of bmapc 
+  | Arr of Unsigned.UInt16.t Varray.t
+
+type t = container IntHashtbl.t
 
 
-type t = (int , container) Hashtbl.t
+let create ?(n=20) () : t = IntHashtbl.create n
+
+let empty () = create () 
+
+let is_empty (bmap : t) = IntHashtbl.length bmap = 0
 
 
-(* TODO: what better than hardcode 100? *)
-let empty : t = Hashtbl.create ~random:false 100
+let stats (bmap : t) = 
+  let cnt (nb,na,l,sz) = function
+    | Bmap b -> (nb+1,na,l+b.sz, sz)
+    | Arr arr  -> (nb,na+1,l+Varray.length arr,sz+Varray.length arr) in
+  let (nb,na,l,sz) = IntHashtbl.fold (fun _ c acc -> cnt acc c) bmap (0,0,0,0) in
+  (("bmaps", nb), ("arrays", na), ("elems", l), ("avg arr size", if na = 0 then 0 else sz / na))
 
-let is_empty (b : t) = 0 == Hashtbl.length b
 
-let in_container i = function
-  | Bmap b -> 
-    (* b is 1024 64-bit words (8kB = 8192 bytes), i in [0..65535]   *)
-    let byte = Bytes.get_uint8 b.d (Unsigned.UInt16.to_int i / 8) in
-    false (*TODO: check if relevant bit is set *)
-  | Arr a ->
-    i == (Varray.get a 0) (* TODO: binsearch in the array *)
+(* Lookup e in arr[lo..hi] by binary search, returning the first index where we'd insert e to preserve the sorted property.
+   Returns i = min value in [lo..hi] such that arr[i] >= e 
+   If e>arr[i] for every i in [lo..hi], then return hi+1
+   Precondition: arr sorted. 
+  *)
+let lookup e arr =
+  let rec look e arr lo hi =
+    if lo > hi then
+      lo
+    else 
+      let mid = lo + (hi-lo) / 2 in
+      match compare e (Varray.get arr mid) with
+      |  0 -> mid
+      | -1 -> look e arr lo (mid-1)
+      |  _ -> look e arr (mid+1) hi
+  in
+  look e arr 0 (Varray.length arr - 1)
 
-let add_to_container i c = 
-  let add_it = function
-    | Bmap b ->
-      (* b is 1024 64-bit words (8kB = 8192 bytes), i in [0..65535]   *)
-      let v = Bytes.get_uint8 b.d (Unsigned.UInt16.to_int i /8) in
-      Bytes.set_int8 b.d (i/8) v (*TODO*)
-    | Arr a ->
-      Varray.push_back a i in   (* TODO: insert at relevant posn *)
-  if not (in_container i c) then
-    add_it c
-
-let add (b : t) i = 
+let mem (bmap : t) i = 
   let key = i asr 16 and
       low = Unsigned.UInt16.of_int i in
-  match Hashtbl.find_opt b key with
-  | None -> Hashtbl.add b key (Arr (Varray.make 1 low ))
-  | Some c -> add_to_container low c (* TODO: convert arr to bmap if size demands it *)
-
-
-let mem (b : t) i = 
-  let key = i asr 16 in
-  match Hashtbl.find_opt b key with
+  match IntHashtbl.find_opt bmap key with
   | None -> false
-  | Some c -> in_container (Unsigned.UInt16.of_int i) c
+  | Some (Bmap b) -> 
+      (* b is 1024 64-bit words (8kB = 8192 bytes), i in [0..65535]   *)
+      let byte = Bytes.get_uint8 b.d (Unsigned.UInt16.to_int low / 8) and
+          mask = 1 lsl ((Unsigned.UInt16.to_int low) mod 8) in
+      byte land mask <> 0
+  | Some (Arr a) -> 
+      let idx = lookup low a in
+      idx >=0 && idx < Varray.length a
 
-let remove i b = 
-  let key = i asr 16 in
-  match Hashtbl.find_opt b key with
+
+let bmapc_add b low = 
+  let low = Unsigned.UInt16.to_int low in
+  let index = low / 8 in 
+  let byte = Bytes.get_uint8 b.d index and
+      mask = 1 lsl (low mod 8) in
+  if byte land mask = 0 then begin
+    let newbyte = byte lor mask in 
+    Bytes.set_uint8 b.d index newbyte;
+    b.sz <- b.sz + 1
+  end
+
+
+
+let add (bmap: t) i = 
+  let key = i asr 16 and
+      low = Unsigned.UInt16.of_int i in
+  match IntHashtbl.find_opt bmap key with
+  | None -> IntHashtbl.add bmap key (Arr (Varray.make 1 low))
+  | Some (Bmap b) -> bmapc_add b low
+  | Some (Arr a) -> 
+      let idx = lookup low a in 
+      if idx = Varray.length a || (idx < Varray.length a && Varray.get a idx <> low) then begin
+        if (Varray.length a = 4096) then
+          (* convert to bmap *)
+          let newc = { sz = 0 ; d = Bytes.make 8192 (Char.chr 0)} in
+          Varray.iter (bmapc_add newc) a;
+          bmapc_add newc low;
+          IntHashtbl.replace bmap key (Bmap newc) 
+        else
+          Varray.insert_at a idx low
+      end
+      else 
+        (* Nothing to do: low is already in the array *)
+        () 
+
+
+let bmapc_iter f bytes =
+  (* bytes is 1024 64-bit words (8kB = 8192 bytes), i in [0..65535] *)
+  for i = 0 to 8191 do
+    let uint = Bytes.get_uint8 bytes i in
+    if uint <> 0 then
+      for j = 0 to 7 do
+        let mask = 1 lsl j in 
+        if uint land mask <> 0 then
+          f (i*8 + j)
+      done
+  done
+
+let bmapc_foldl f acc bytes =
+  let r = ref acc in
+  bmapc_iter (fun u16 -> r := f (!r) u16) bytes;
+  !r
+  
+
+let remove (bmap : t) i = 
+  let key = i asr 16 and
+      low = i land 65535 in
+  match IntHashtbl.find_opt bmap key with
   | None -> ()
-  | Some c -> ()  (* TODO *)
+  | Some (Bmap b) -> 
+    (* b is 1024 64-bit words (8kB = 8192 bytes), i in [0..65535] *)
+    let index = low / 8 in 
+    let byte = Bytes.get_uint8 b.d index and
+        mask = 1 lsl (low mod 8) in
+    if byte land mask <> 0 then begin
+        if b.sz > 4097 then
+          let newbyte = byte land (255 - mask) in 
+          Bytes.set_uint8 b.d index newbyte;
+          b.sz <- b.sz - 1
+        else begin
+          let newc = Varray.empty () in
+          (* TODO: create array of size 4096 and use set instead of push_back *)
+          bmapc_iter (fun u16 -> if u16 <> low then Varray.push_back newc (Unsigned.UInt16.of_int u16)) b.d;
+          IntHashtbl.replace bmap key (Arr newc) 
+        end 
+      end
+  | Some (Arr a) -> 
+    let low = Unsigned.UInt16.of_int low in
+    let idx = lookup low a in 
+    if idx < Varray.length a && Varray.get a idx = low then
+      if Varray.length a = 1 then 
+        IntHashtbl.remove bmap key
+      else
+        Varray.delete_at a idx
 
-
-(* Note: min, max not efficient with a hashtable, unless cached, like sz
-let min_elt (b : t) = if is_empty b then None else Some 0
-
-let max_elt (b : t) = if is_empty b then None else Some 0
-*)
-
-(* Complexity: linear in the number of containers *)
-let length (b : t) =
-  let len = function
-    | Bmap b -> b.sz
-    | Arr a -> Varray.length a in
-  Hashtbl.fold (fun _ c acc -> acc + len c) b 0
-
-
-
-let union (b1 : t) b2 =
-  let replace bm c1 c2 = c1 in
-  let s, l = if Hashtbl.length b1 < Hashtbl.length b2 then b1,b2 else b2,b1 in
-  let r = Hashtbl.copy l in
-  Hashtbl.iter (fun k v -> (Hashtbl.add r k v)) s; (* TODO: merge where keys agree *)
-  r
-
-let intersection (b1 : t) b2 = 
-  let s, l = if Hashtbl.length b1 < Hashtbl.length b2 then b1,b2 else b2,b1 in
-  let r = Hashtbl.copy s in
-  let f k = None in 
-  Hashtbl.filter_map_inplace (fun k v -> f k) r; (* TODO *)
-  r
-
-let flip (b : t) = "todo" 
 
 
 let of_iterable iter s =
-  let bmap = empty in
+  let bmap = empty() in
   iter (add bmap) s;
   bmap
 
@@ -101,94 +162,28 @@ let of_list = of_iterable List.iter
 
 let of_array = of_iterable Array.iter
 
-(** {1 Iterators} *)
-
-let to_seq b = Seq.empty
-let of_seq s = of_iterable Seq.iter
+let of_seq = of_iterable Seq.iter
 
 
-let iter f (b : t) =
+(* Note: doesn't iterate in sorted order of elements *)
+let iter f (bmap : t) =
   let citer k = function
-  | Bmap b ->  Bytes.iter (fun _ -> ()) b.d
-  | Arr a -> Varray.iter (fun _ -> ()) a in
-
-  Hashtbl.iter (fun k c -> citer k c) b (* TODO *)
-
-let fold f init (b : t) = Seq.fold_left f init (to_seq b)
+    | Bmap b -> bmapc_iter (fun u16 -> f ((k lsl 16) lor u16)) b.d
+    | Arr a -> Varray.iter (fun u16 -> f ((k lsl 16) lor Unsigned.UInt16.to_int u16)) a 
+  in
+  IntHashtbl.iter citer bmap 
 
 
-let vector_insert_at v i elt =
-  let open Vector in
-  (* TODO: optimize with push if adding at end *)
-  let l = length v in
-  (* TODO: exception if i > len *)
-  resize v (1+l);
-  blit v i v (i+1) (l-i);
-  set v i elt  
-
-(* 
-
-see this in Base.Binary_search
-(* Find the index where an element [e] should be inserted *)
-binary_search t ~get ~length ~compare `First_greater_than_or_equal_to e;
-
-Base.Ordered_collection_common
-
-*)
-
-(* see https://discuss.ocaml.org/t/ann-carray-0-0-1/9938/6
-   
-...struct
-  external get_int64_unsafe : bytes -> int -> int64 = "%caml_bytes_get64u"
-  external set_int64_unsafe : bytes -> int -> int64 -> unit = "%caml_bytes_set64u"
-  type t = Bytes.t
-  let create x y =
-    let p = Bytes.create 16 in 
-    set_int64_unsafe p 0 (Int64.of_int x);
-    set_int64_unsafe p 8 (Int64.of_int y); ...
-
-*)
-
-(* https://discuss.ocaml.org/t/pretty-printing-binary-ints/9062/7 *)
-let int_size = Sys.word_size - 1
-let int2bin =
-  let buf = Bytes.create int_size in
-  fun n ->
-    for i = 0 to int_size - 1 do
-      let pos = int_size - 1 - i in
-      Bytes.set buf pos (if n land (1 lsl i) != 0 then '1' else '0')
-    done;
-    (* skip leading zeros *)
-    match Bytes.index_opt buf '1' with
-    | None -> "0b0"
-    | Some i -> "0b" ^ Bytes.sub_string buf i (int_size - i)
+let fold f (bmap : t) z =
+  let foldc k c acc = 
+    match c with
+    | Bmap b -> bmapc_foldl (fun acc u16 -> f acc ((k lsl 16) lor u16)) acc b.d
+    | Arr a -> Varray.fold_left (fun acc u16 -> f acc ((k lsl 16) lor Unsigned.UInt16.to_int u16)) acc a 
+  in 
+  IntHashtbl.fold foldc bmap z
 
 
+let to_seq (bmap : t) = 
+  let s = Seq.empty in
+  fold (fun acc i -> Seq.cons i acc) bmap s
 
-
-
-
-(* typed hole 
-let g x y = x + 1 + (_) y
-*)
-
-(* 
-  int sets implemented as a list of ranges
-
-  see:  /home/fermin/.opam/default_4.14.0/lib/core_kernel/int_set/int_set.ml 
-   type t = Range.t list
-
-   https://v3.ocaml.org/p/core_kernel/v0.15.0/doc/Int_set/index.html
-
-   val empty : t
-
-*)
-
-
-
-(* 
-  integers
-
-> List.map Unsigned.UInt32.to_int Unsigned.UInt32.[of_int 103; one; of_string "1000"];;
-- : int list = [103; 1; 1000]
-*)
